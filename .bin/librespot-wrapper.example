@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Example wrapper that attempts to use librespot (if installed) to play a spotify URI
+# and pipe raw WAV to stdout via ffmpeg. Adjust to your system and librespot invocation.
+
+URI="$1"
+if [ -z "$URI" ]; then
+  echo "Usage: $0 --uri <spotify-uri> --stdout" >&2
+  exit 2
+fi
+
+# This is just an illustrative script. Replace with an actual implementation.
+# Option A: run librespot (if installed) and pipe to stdout (librespot might support --stdout or similar)
+# librespot --username YOUR_USER --password YOUR_PASS --name mybot --backend pipe --pipe /tmp/spotify_fifo &
+# mkfifo /tmp/spotify_fifo
+# ffmpeg -f s16le -ar 44100 -ac 2 -i /tmp/spotify_fifo -f wav -
+
+# Option B: If you have a standalone helper binary that accepts `--uri` and writes WAV to stdout, use it directly
+# ./librespot-helper --uri "$URI" --stdout
+
+# For now, print an informative message and exit non-zero so the bot falls back to YouTube
+echo "No streaming helper configured. See .bin/README.md for setup instructions." >&2
+exit 1
