@@ -2,3 +2,4 @@
 .env
 /tools/librespot-wrapper/.env
 /tools/librespot-wrapper/target
+sync_config.jsonc
