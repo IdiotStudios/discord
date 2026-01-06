@@ -37,6 +37,21 @@ pub async fn handle_start(
         }
     };
 
+    // Handle listing services
+    if service_key.eq_ignore_ascii_case("list") {
+        if cfg.services.is_empty() {
+            channel_id
+                .say(&ctx.http, "No services configured in config.jsonc")
+                .await?;
+        } else {
+            let mut names = cfg.services.keys().cloned().collect::<Vec<_>>();
+            names.sort();
+            let msg = format!("Available start services ({}): {}", names.len(), names.join(", "));
+            channel_id.say(&ctx.http, msg).await?;
+        }
+        return Ok(());
+    }
+
     let svc = match cfg.services.get(&service_key) {
         Some(s) => s,
         None => {
