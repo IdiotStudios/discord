@@ -51,6 +51,34 @@ Follow the browser prompts and paste the returned refresh token into `.env` as `
 - `music streamtest <spotify-url>` — record 10s sample from the configured Spotify helper and run `ffprobe` for diagnostics.
 - Control panel message shows playback status and buttons for Pause/Resume/Stop/Vol+/Vol-
 
+### Start command
+
+- `start <service> [args]` — sends a POST to a configured service and reports the response.
+   - Configuration file: `config.jsonc` at the project root (auto-created with defaults on first run).
+   - Example (JSONC):
+
+```json
+{
+   // Start command configuration
+   "start": {
+      "services": {
+         "mc": {
+            "url": "http://localhost:8080/start",
+            "method": "POST",
+            "headers": { "Content-Type": "application/json" },
+            "body": { "action": "start" },
+            "args_field": "args",
+            "timeout_secs": 10
+         }
+      }
+   }
+}
+```
+
+- Usage in Discord: `!is start mc` or `!is start mc server-1` (the extra text is placed in the JSON body under the `args_field`, default `args`).
+
+- NOTE: May have to rename this to something else and make multiple commands, an example would be !is put/post/get mc
+
 ## Troubleshooting
 
 - Invalid refresh token: re-run the auth helper and update `.env`.
