@@ -10,6 +10,7 @@ use std::env;
 
 mod music;
 mod start;
+mod config;
 
 use crate::music::{ensure_media_tools, handle_music};
 use crate::start::{handle_start};

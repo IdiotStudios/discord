@@ -1,73 +1,4 @@
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::io::ErrorKind;
-
-#[derive(Debug, Deserialize)]
-struct AppConfig {
-    #[serde(default)]
-    start: Option<StartConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StartConfig {
-    services: HashMap<String, ServiceConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ServiceConfig {
-    url: String,
-    #[serde(default)]
-    method: Option<String>,
-    #[serde(default)]
-    headers: Option<HashMap<String, String>>,
-    #[serde(default)]
-    body: Option<serde_json::Value>,
-    #[serde(default)]
-    args_field: Option<String>,
-    #[serde(default)]
-    timeout_secs: Option<u64>,
-}
-
-const CONFIG_PATH: &str = "config.jsonc";
-const DEFAULT_CONFIG: &str = r#"// Global bot config (JSONC: supports comments)
-{
-    // Start command configuration
-    "start": {
-        "services": {
-            // Example Minecraft service
-            "mc": {
-                "url": "http://localhost:8080/start",
-                "method": "POST",
-                "headers": {
-                    "Content-Type": "application/json"
-                },
-                "body": { "action": "start" },
-                "args_field": "args",
-                "timeout_secs": 10
-            }
-        }
-    }
-}
-"#;
-
-async fn load_config() -> Result<StartConfig, Box<dyn std::error::Error + Send + Sync>> {
-        let contents = match tokio::fs::read_to_string(CONFIG_PATH).await {
-                Ok(s) => s,
-                Err(e) if e.kind() == ErrorKind::NotFound => {
-                        // Auto-create a default config if missing
-                        tokio::fs::write(CONFIG_PATH, DEFAULT_CONFIG).await?;
-                        DEFAULT_CONFIG.to_string()
-                }
-                Err(e) => return Err(Box::new(e)),
-        };
-
-        let cfg: AppConfig = json5::from_str(&contents)?;
-        if let Some(start) = cfg.start {
-                Ok(start)
-        } else {
-                Err("config.jsonc missing 'start' section".into())
-        }
-}
+use crate::config::load_config;
 
 pub async fn handle_start(
     ctx: &serenity::prelude::Context,
@@ -87,7 +18,15 @@ pub async fn handle_start(
     let extra_args = parts.collect::<Vec<_>>().join(" ");
 
     let cfg = match load_config().await {
-        Ok(c) => c,
+        Ok(c) => match c.start {
+            Some(s) => s,
+            None => {
+                channel_id
+                    .say(&ctx.http, "Config missing 'start' section in config.jsonc")
+                    .await?;
+                return Ok(());
+            }
+        },
         Err(e) => {
             channel_id
                 .say(&ctx.http, format!(
