@@ -112,6 +112,9 @@ impl EventHandler for Handler {
                         eprintln!("Error handling music command: {why:?}");
                     }
                 }
+                "start" => {
+                    // reserved for future use
+                }
                 _ => {}
             }
         }
