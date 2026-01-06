@@ -68,7 +68,6 @@ pub async fn handle_music(
         "join" => join(ctx, channel, user_voice, user_id, guild_id, &remainder, embed_color).await,
         "leave" => leave(ctx, channel, user_id, guild_id, embed_color).await,
         "play" => play(ctx, channel, user_id, guild_id, &remainder, embed_color).await,
-        "streamtest" => streamtest(ctx, channel, guild_id, &remainder, embed_color).await,
         "control" => {
             if let Some(gid) = guild_id {
                 if let Err(e) = send_control_panel(ctx, channel, user_id, gid, embed_color).await {
@@ -1009,110 +1008,6 @@ async fn send_info(
     Ok(())
 }
 
-async fn streamtest(ctx: &Context, channel: ChannelId, guild_id: Option<GuildId>, uri: &str, color: u32) -> MusicResult<()> {
-    if uri.trim().is_empty() {
-        send_info(ctx, channel, color, "Stream Test", "Provide a Spotify track URL: music streamtest <url>").await?;
-        return Ok(());
-    }
-
-    // Resolve command
-    if let Some(cmd) = get_spotify_stream_cmd(uri) {
-        // Prepare temp sample path
-        let tmpdir = std::env::temp_dir();
-        let uniq = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
-        let sample_path = tmpdir.join(format!("spotify-sample-{}.wav", uniq));
-
-        // Build a shell command to record 10 seconds to WAV via ffmpeg, capturing helper stderr to a file for diagnostics
-        let helper_log = tmpdir.join(format!("spotify-helper-{}.log", uniq));
-        let ff_cmd = format!("( {cmd} ) 2> {helper_log} | ffmpeg -hide_banner -loglevel error -i - -t 10 -vn -c:a pcm_s16le -ar 48000 -ac 2 -f wav {sample}", cmd = cmd, helper_log = helper_log.to_string_lossy(), sample = sample_path.to_string_lossy());
-
-        // Run the command (blocking on child completion)
-        let out = tokio::process::Command::new("sh").arg("-c").arg(&ff_cmd).output().await;
-
-        match out {
-            Ok(o) => {
-                // Read helper stderr for diagnostics
-                let helper_stderr = tokio::fs::read_to_string(&helper_log).await.unwrap_or_else(|_| "<no helper stderr>".into());
-
-                if !o.status.success() {
-                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                    let desc = format!("Recording failed (ffmpeg exit code {}).\nffmpeg stderr:\n{}\n\nhelper stderr:\n{}", o.status.code().unwrap_or(-1), if stderr.is_empty() { "<empty>".into() } else { stderr.clone() }, helper_stderr);
-                    send_info(ctx, channel, color, "Stream Test - Record Failed", &desc).await?;
-                    let _ = tokio::fs::remove_file(&helper_log).await;
-                    return Ok(());
-                }
-
-                // Remove helper log on success (but keep it for 5s in case user wants it)
-                let helper_log_clone = helper_log.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    let _ = tokio::fs::remove_file(&helper_log_clone).await;
-                });
-
-                // Run ffprobe on the resulting file to gather metadata
-                let probe = tokio::process::Command::new("ffprobe")
-                    .arg("-hide_banner")
-                    .arg("-loglevel")
-                    .arg("error")
-                    .arg("-show_format")
-                    .arg("-show_streams")
-                    .arg("-print_format")
-                    .arg("json")
-                    .arg(&sample_path)
-                    .output()
-                    .await;
-
-                match probe {
-                    Ok(p) => {
-                        let info = String::from_utf8_lossy(&p.stdout).to_string();
-                        // Truncate if too long
-                        let info_short = if info.len() > 1900 { format!("{}\n...[truncated]", &info[..1900]) } else { info.clone() };
-                        let desc = format!("Recorded 10s sample to `{}`. ffprobe output:\n{}", sample_path.display(), info_short);
-
-                        // Attempt to attach the file if under 8MB
-                        let mut sent = channel.send_message(&ctx.http, CreateMessage::new().content(desc.clone())).await?;
-
-                        if let Ok(meta) = tokio::fs::metadata(&sample_path).await {
-                            if meta.len() > 8_000_000 {
-                                // Too large to attach to Discord; keep local and inform path
-                                let _ = send_info(ctx, channel, color, "Stream Test - Sample Saved", &format!("Saved sample to {} ({} bytes). File too large to upload.", sample_path.display(), meta.len())).await;
-                            } else {
-                                // Attach by editing message and adding the file
-                                // Use CreateMessage::new with file attachment
-                                let b = tokio::fs::read(&sample_path).await?;
-                                let mut msg = CreateMessage::new().content(format!("Sample ({} bytes):", b.len()));
-                                msg = msg.add_file(serenity::builder::CreateAttachment::bytes(b, "sample.wav"));
-                                let _ = channel.send_message(&ctx.http, msg).await?;
-                            }
-                        }
-
-                        // Clean up sample file after a short delay so user can download if attached
-                        let sp = sample_path.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                            let _ = tokio::fs::remove_file(&sp).await;
-                        });
-
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        send_info(ctx, channel, color, "Stream Test - Probe Failed", &format!("Recorded sample at {} but ffprobe failed: {e:?}", sample_path.display())).await?;
-                        return Ok(());
-                    }
-                }
-            }
-            Err(e) => {
-                send_info(ctx, channel, color, "Stream Test - Execution Failed", &format!("Failed to run recording command: {e:?}")).await?;
-                return Ok(());
-            }
-        }
-    } else {
-        send_info(ctx, channel, color, "Stream Test", "No Spotify stream command configured (set SPOTIFY_STREAM_CMD or place `librespot-wrapper` in .bin)").await?;
-    }
-
-    Ok(())
-}
-
 async fn send_temp_info(ctx: Context, channel: ChannelId, content: &str) -> MusicResult<()> {
     // Send a short non-embedded message and delete it after a short delay to mimic ephemeral behavior
     let msg = channel
@@ -1141,7 +1036,7 @@ async fn send_control_panel(
     use serenity::all::ButtonStyle;
 
     // Attempt to fetch current track info
-    let mut desc = String::new();
+    let mut _desc = String::new();
     let maybe_store = ctx.data.read().await.get::<crate::TrackStore>().cloned();
 
     if let Some(store) = maybe_store {
@@ -1177,18 +1072,17 @@ async fn send_control_panel(
                     } else {
                         "Unknown".into()
                     };
-
-                    desc = format!("Status: {:?}\nVolume: {:.2}\nRemaining: {}", info.playing, info.volume, remaining);
+                   _desc = format!("Status: {:?}\nVolume: {:.2}\nRemaining: {}", info.playing, info.volume, remaining);
                 }
                 Err(_) => {
-                    desc = "Status: Unknown".into();
+                    _desc = "Status: Unknown".into();
                 }
             }
         } else {
-            desc = "No active track".into();
+            _desc = "No active track".into();
         }
     } else {
-        desc = "No active track store".into();
+        _desc = "No active track store".into();
     }
 
     // Try to get track title/artist/thumbnail from TrackMetaStore to make the embed more prominent
@@ -1207,7 +1101,7 @@ async fn send_control_panel(
         }
     }
 
-    let mut embed = CreateEmbed::new().title(title_str).description(desc).color(color);
+    let mut embed = CreateEmbed::new().title(title_str).description(_desc).color(color);
     if let Some(th) = thumbnail_opt {
         embed = embed.thumbnail(th);
     }
