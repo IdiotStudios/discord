@@ -4,6 +4,8 @@ use serenity::{
     model::{channel::Message, gateway::Ready},
     prelude::*,
 };
+use poise::serenity_prelude as serenity;
+use poise::FrameworkError;
 use songbird::SerenityInit;
 use dotenvy::dotenv;
 use std::env;
@@ -318,6 +320,7 @@ async fn main() {
         data.insert::<TrackStore>(Arc::new(Mutex::new(HashMap::new())));
         data.insert::<TrackMetaStore>(Arc::new(Mutex::new(HashMap::new())));
     }
+
 
     if let Err(why) = client.start().await {
         eprintln!("Client error: {why:?}");
