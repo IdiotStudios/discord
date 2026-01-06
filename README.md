@@ -1,11 +1,13 @@
-# Discord Music Bot
+# Discord Bot
 
-A Discord music bot with Spotify and YouTube support, written in Rust using Serenity and Songbird. Features:
+Note: This bot is more of for private use not for a whole community to be using unless your not worried about anyone being able to use the commands. A permission system will be added in the future
 
-- Interactive control panel with live updates (status, volume, remaining time, title/artist, thumbnail)
-- Play from search, YouTube, and (experimental) direct Spotify streaming
+A Discord bot with written in Rust using Serenity. Features:
+
+- Interactive music control panel with live updates (status, volume, remaining time, title/artist, thumbnail)
+- Play music from search, YouTube, and (experimental) direct Spotify streaming
 - Automatic helper setup for Spotify streaming (`.bin/librespot-wrapper` or compiled `librespot`)
-- `streamtest` command to record and inspect helper/ffmpeg output for diagnostics
+- A Start Command to start any of your services easily via discord.
 
 ---
 
@@ -48,7 +50,6 @@ Follow the browser prompts and paste the returned refresh token into `.env` as `
 ## Commands
 
 - `music play <query|url>` — play a track or search query.
-- `music streamtest <spotify-url>` — record 10s sample from the configured Spotify helper and run `ffprobe` for diagnostics.
 - Control panel message shows playback status and buttons for Pause/Resume/Stop/Vol+/Vol-
 
 ### Start command

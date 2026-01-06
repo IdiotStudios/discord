@@ -83,6 +83,8 @@ impl EventHandler for Handler {
                         ("music play <song>", "Search (Spotify -> YouTube) and queue"),
                         ("music leave", "Disconnect from voice"),
                         ("music control", "Show music control panel"),
+                        ("start <service> [args]", "Start a service defined in config"),
+                        ("start help", "Show start command help"),
                     ]
                     .iter()
                     .map(|(name, desc)| {
