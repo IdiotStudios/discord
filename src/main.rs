@@ -9,8 +9,10 @@ use dotenvy::dotenv;
 use std::env;
 
 mod music;
+mod start;
 
 use crate::music::{ensure_media_tools, handle_music};
+use crate::start::{handle_start};
 use serenity::all::Interaction;
 use serenity::model::id::{GuildId, UserId};
 use serenity::prelude::TypeMapKey;
@@ -113,7 +115,9 @@ impl EventHandler for Handler {
                     }
                 }
                 "start" => {
-                    // reserved for future use
+                    if let Err(why) = handle_start(&ctx, channel_id, &args).await {
+                        eprintln!("Error handling start command: {why:?}");
+                    }
                 }
                 _ => {}
             }
