@@ -12,6 +12,7 @@ mod music;
 mod start;
 mod config;
 
+use crate::config::ensure_default_config;
 use crate::music::{ensure_media_tools, handle_music};
 use crate::start::{handle_start};
 use serenity::all::Interaction;
@@ -283,6 +284,11 @@ impl EventHandler for Handler {
 async fn main() {
     dotenv().ok();
     let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN not set");
+
+    // Ensure config.jsonc exists (creates default if missing)
+    if let Err(e) = ensure_default_config().await {
+        eprintln!("Failed to ensure config: {e:?}");
+    }
 
     ensure_media_tools()
         .await
