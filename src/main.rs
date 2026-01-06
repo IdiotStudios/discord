@@ -79,6 +79,7 @@ impl EventHandler for Handler {
                         ("music join", "Join your voice channel"),
                         ("music play <song>", "Search (Spotify -> YouTube) and queue"),
                         ("music leave", "Disconnect from voice"),
+                        ("music control", "Show music control panel"),
                     ]
                     .iter()
                     .map(|(name, desc)| {
