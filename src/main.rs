@@ -1,13 +1,15 @@
-use serenity::{
-    async_trait,
-    builder::{CreateEmbed, CreateMessage},
-    model::{channel::Message, gateway::Ready},
-    prelude::*,
-};
 use poise::serenity_prelude as serenity;
+use serenity::builder::{
+    CreateEmbed, CreateInteractionResponse, CreateInteractionResponseMessage,
+};
+use serenity::model::id::{GuildId, UserId};
+use serenity::prelude::*;
 use songbird::SerenityInit;
 use dotenvy::dotenv;
+use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 mod music;
 mod start;
@@ -15,27 +17,27 @@ mod config;
 mod modalert;
 
 use crate::config::ensure_default_config;
+use crate::modalert::{
+    ensure_modalert_store, is_modalert_enabled, save_modalert_store, ModAlertStore,
+};
 use crate::music::{ensure_media_tools, handle_music};
-use crate::start::{handle_start};
-use crate::modalert::{ensure_modalert_store, save_modalert_store, ModAlertStore, is_modalert_enabled};
-use serenity::all::Interaction;
-use serenity::model::id::{GuildId, UserId};
-use serenity::prelude::TypeMapKey;
-use serenity::builder::{CreateInteractionResponse, CreateInteractionResponseMessage};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use crate::start::handle_start;
 
-const PREFIX: &str = "!is ";
+// ---------- Shared constants ----------
+const PREFIX: &str = "!is"; // users can type "!is ..."
 const EMBED_COLOR: u32 = 0x5865F2;
 
-struct Handler;
+// ---------- Poise data & error ----------
+pub struct Data;
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub type Ctx<'a> = poise::Context<'a, Data, Error>;
 
-// Storage for currently playing track handles per guild
+// ---------- Shared TypeMap stores ----------
 struct TrackStore;
-impl TypeMapKey for TrackStore { type Value = Arc<Mutex<HashMap<GuildId, songbird::tracks::TrackHandle>>>; }
+impl TypeMapKey for TrackStore {
+    type Value = Arc<Mutex<HashMap<GuildId, songbird::tracks::TrackHandle>>>;
+}
 
-// Per-guild rich metadata for the currently playing track (title, artist, duration, thumbnail)
 #[derive(Clone, Debug, Default)]
 pub struct TrackMeta {
     pub title: Option<String>,
@@ -43,249 +45,315 @@ pub struct TrackMeta {
     pub duration: Option<std::time::Duration>,
     pub thumbnail: Option<String>,
 }
-
 struct TrackMetaStore;
-impl TypeMapKey for TrackMetaStore { type Value = Arc<Mutex<HashMap<GuildId, TrackMeta>>>; }
+impl TypeMapKey for TrackMetaStore {
+    type Value = Arc<Mutex<HashMap<GuildId, TrackMeta>>>;
+}
 
-#[async_trait]
-impl EventHandler for Handler {
-    async fn message(&self, ctx: Context, msg: Message) {
-        // move any data we need out of the potentially non-Send `Message` before awaiting
-        let author_is_bot = msg.author.bot;
-        let channel_id = msg.channel_id;
-        let author_id = msg.author.id;
-        let guild_id = msg.guild_id;
-        let content = msg.content.clone();
+// ---------- Commands ----------
+#[poise::command(prefix_command, slash_command)]
+async fn ping(ctx: Ctx<'_>) -> Result<(), Error> {
+    ctx.say("Pong!").await?;
+    Ok(())
+}
 
-        // Drop the original `Message` so the async future doesn't hold non-Send pointers
-        drop(msg);
+#[poise::command(prefix_command, slash_command)]
+async fn help(
+    ctx: Ctx<'_>,
+    #[description = "Specific command to show help for"] command: Option<String>,
+) -> Result<(), Error> {
+    poise::builtins::help(
+        ctx,
+        command.as_deref(),
+        poise::builtins::HelpConfiguration::default(),
+    )
+    .await?;
+    Ok(())
+}
 
-        if author_is_bot {
-            return;
+#[poise::command(prefix_command, slash_command)]
+async fn modalert(ctx: Ctx<'_>) -> Result<(), Error> {
+    ctx.defer().await?;
+    let sctx = ctx.serenity_context();
+    let guild_id = match ctx.guild_id() {
+        Some(g) => g,
+        None => {
+            ctx.say("This command can only be used in a server.").await?;
+            return Ok(());
         }
+    };
 
-        if let Some(command) = content.trim().strip_prefix(PREFIX) {
-            let command = command.trim();
+    // Only server owner can toggle
+    let is_owner = {
+        if let Some(g) = sctx.cache.guild(guild_id) {
+            g.owner_id == ctx.author().id
+        } else if let Ok(pg) = guild_id.to_partial_guild(&sctx.http).await {
+            pg.owner_id == ctx.author().id
+        } else {
+            false
+        }
+    };
 
-            let mut parts = command.split_whitespace();
-            let cmd = parts.next().unwrap_or("");
-            let args = parts.collect::<Vec<_>>().join(" ");
+    if !is_owner {
+        ctx.say("Only the server owner can toggle mod alerts.").await?;
+        return Ok(());
+    }
 
-            let cmd_lower = cmd.to_ascii_lowercase();
+    let toggled_on = {
+        let data = sctx.data.read().await;
+        if let Some(store) = data.get::<ModAlertStore>() {
+            let mut set = store.lock().await;
+            if set.contains(&guild_id) {
+                set.remove(&guild_id);
+                false
+            } else {
+                set.insert(guild_id);
+                true
+            }
+        } else {
+            false
+        }
+    };
 
-            match cmd_lower.as_str() {
-                "ping" => {
-                    if let Err(why) = channel_id.say(&ctx.http, "Pong!").await {
-                        eprintln!("Error sending message: {why:?}");
-                    }
+    if let Err(e) = save_modalert_store(sctx).await {
+        eprintln!("Failed saving modalert store: {e:?}");
+    }
+
+    if toggled_on {
+        ctx.say("Mod alerts enabled for this server.").await?;
+    } else {
+        ctx.say("Mod alerts disabled for this server.").await?;
+    }
+    Ok(())
+}
+
+#[poise::command(
+    prefix_command,
+    slash_command,
+    subcommands("music_join", "music_play", "music_leave", "music_control"),
+    rename = "music",
+    track_edits
+)]
+async fn music(_ctx: Ctx<'_>) -> Result<(), Error> {
+    Ok(())
+}
+
+#[poise::command(prefix_command, slash_command, rename = "join")]
+async fn music_join(
+    ctx: Ctx<'_>,
+    #[description = "Voice channel id or mention (optional)"] channel: Option<String>,
+) -> Result<(), Error> {
+    ctx.defer().await?;
+    let sctx = ctx.serenity_context();
+    let channel_id = ctx.channel_id();
+    let author_id = ctx.author().id;
+    let guild_id = ctx.guild_id();
+
+    // Try to parse a channel id/mention if provided
+    let arg = channel.unwrap_or_default();
+    let parsed_channel: Option<serenity::model::id::ChannelId> = arg
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.trim().trim_start_matches("<#").trim_end_matches('>').parse::<u64>().ok())
+        .map(serenity::model::id::ChannelId::from);
+
+    // Best-effort detection if none provided
+    let user_vc = if parsed_channel.is_some() {
+        parsed_channel
+    } else {
+        guild_id.and_then(|gid| {
+            sctx.cache
+                .guild(gid)
+                .and_then(|g| g.voice_states.get(&author_id).and_then(|vs| vs.channel_id))
+        })
+    };
+
+    handle_music(
+        sctx,
+        channel_id,
+        user_vc,
+        author_id,
+        guild_id,
+        "join",
+        EMBED_COLOR,
+    )
+    .await
+    .map_err(|e| e.into())
+}
+
+#[poise::command(prefix_command, slash_command, rename = "play")]
+async fn music_play(
+    ctx: Ctx<'_>,
+    #[description = "Song name or URL"] query: String,
+) -> Result<(), Error> {
+    ctx.defer().await?;
+    let sctx = ctx.serenity_context();
+    let channel_id = ctx.channel_id();
+    let author_id = ctx.author().id;
+    let guild_id = ctx.guild_id();
+    let args = format!("play {}", query);
+    handle_music(sctx, channel_id, None, author_id, guild_id, &args, EMBED_COLOR).await?;
+    Ok(())
+}
+
+#[poise::command(prefix_command, slash_command, rename = "leave")]
+async fn music_leave(ctx: Ctx<'_>) -> Result<(), Error> {
+    ctx.defer().await?;
+    let sctx = ctx.serenity_context();
+    let channel_id = ctx.channel_id();
+    let author_id = ctx.author().id;
+    let guild_id = ctx.guild_id();
+    handle_music(sctx, channel_id, None, author_id, guild_id, "leave", EMBED_COLOR).await?;
+    Ok(())
+}
+
+#[poise::command(prefix_command, slash_command, rename = "control")]
+async fn music_control(ctx: Ctx<'_>) -> Result<(), Error> {
+    ctx.defer().await?;
+    let sctx = ctx.serenity_context();
+    let channel_id = ctx.channel_id();
+    let author_id = ctx.author().id;
+    let guild_id = ctx.guild_id();
+    handle_music(sctx, channel_id, None, author_id, guild_id, "control", EMBED_COLOR).await?;
+    Ok(())
+}
+
+#[poise::command(prefix_command, slash_command, rename = "start")]
+async fn start_service(
+    ctx: Ctx<'_>,
+    #[description = "Service key (or 'list')"] service: String,
+    #[description = "Extra args (optional)"] args: Option<String>,
+) -> Result<(), Error> {
+    ctx.defer().await?;
+    let sctx = ctx.serenity_context();
+    let channel_id = ctx.channel_id();
+    let joined = if let Some(a) = args {
+        format!("{} {}", service, a)
+    } else {
+        service
+    };
+    handle_start(sctx, channel_id, joined.trim()).await.map_err(|e| e.into())
+}
+
+// ---------- Event forwarding ----------
+async fn poise_event_handler(
+    ctx: &serenity::Context,
+    event: &serenity::FullEvent,
+    framework_ctx: poise::FrameworkContext<'_, Data, Error>,
+    _data: &Data,
+) -> Result<(), Error> {
+    match event {
+        serenity::FullEvent::Ready { data_about_bot, .. } => {
+            println!("Connected as {}", data_about_bot.user.name);
+        }
+        serenity::FullEvent::GuildCreate { guild, .. } => {
+            let gid = guild.id;
+            if let Err(e) = poise::builtins::register_in_guild(
+                ctx,
+                &framework_ctx.options().commands,
+                gid,
+            )
+            .await
+            {
+                eprintln!("Failed to register commands in guild {}: {e:?}", gid);
+            }
+        }
+        serenity::FullEvent::GuildMemberUpdate { old_if_available, new, event } => {
+            let gid = event.guild_id;
+            if !is_modalert_enabled(ctx, gid).await {
+                return Ok(());
+            }
+
+            let new_until = new
+                .as_ref()
+                .and_then(|m| m.communication_disabled_until)
+                .or(event.communication_disabled_until);
+            let old_until = old_if_available
+                .as_ref()
+                .and_then(|m| m.communication_disabled_until);
+
+            let is_timeout_newly_applied = match (old_until, new_until) {
+                (Some(old_ts), Some(new_ts)) => new_ts > old_ts,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if !is_timeout_newly_applied { return Ok(()); }
+
+            let user_tag = new
+                .as_ref()
+                .map(|m| m.user.tag())
+                .unwrap_or_else(|| event.user.tag());
+
+            let owner_id = if let Some(g) = ctx.cache.guild(gid) { g.owner_id } else {
+                match gid.to_partial_guild(&ctx.http).await {
+                    Ok(pg) => pg.owner_id,
+                    Err(_) => return Ok(()),
                 }
-                "modalert" => {
-                    if let Some(gid) = guild_id {
-                        // Only guild owner can toggle
-                        let cached_owner = { ctx.cache.guild(gid).map(|g| g.owner_id) };
-                        let mut is_owner = cached_owner.map(|oid| oid == author_id).unwrap_or(false);
-                        if !is_owner {
-                            if let Ok(pg) = gid.to_partial_guild(&ctx.http).await {
-                                is_owner = pg.owner_id == author_id;
-                            }
-                        }
-                        if !is_owner {
-                            let _ = channel_id
-                                .say(&ctx.http, "Only the server owner can toggle mod alerts.")
-                                .await;
-                            return;
-                        }
+            };
+            let content = format!(
+                "Moderation alert: {} was timed out in server {}.",
+                user_tag,
+                gid
+            );
+            if let Ok(dm) = owner_id.create_dm_channel(&ctx.http).await {
+                let _ = dm.say(&ctx.http, content).await;
+            }
+        }
+        serenity::FullEvent::InteractionCreate { interaction } => {
+            if let serenity::all::Interaction::Component(mc) = interaction.clone() {
+                // custom_id format: music:<action>:<user_id>:<guild_id>
+                let custom_id = mc.data.custom_id.clone();
+                let mut parts = custom_id.split(':');
+                let prefix = parts.next().unwrap_or("");
+                if prefix != "music" { return Ok(()); }
+                let action = parts.next().unwrap_or("");
+                let owner_id = parts
+                    .next()
+                    .and_then(|s: &str| s.parse::<u64>().ok())
+                    .map(|v| UserId::new(v));
+                let guild_id = parts
+                    .next()
+                    .and_then(|s: &str| s.parse::<u64>().ok())
+                    .map(|v| GuildId::new(v));
 
-                        // Toggle in shared store and persist
-                        let toggled_on = {
-                            let data = ctx.data.read().await;
-                            if let Some(store) = data.get::<ModAlertStore>() {
-                                let mut set = store.lock().await;
-                                if set.contains(&gid) {
-                                    set.remove(&gid);
-                                    false
-                                } else {
-                                    set.insert(gid);
-                                    true
-                                }
-                            } else {
-                                false
-                            }
-                        };
-
-                        if let Err(e) = save_modalert_store(&ctx).await {
-                            eprintln!("Failed saving modalert store: {e:?}");
-                        }
-
-                        let msg_txt = if toggled_on {
-                            "Mod alerts enabled for this server."
-                        } else {
-                            "Mod alerts disabled for this server."
-                        };
-                        let _ = channel_id.say(&ctx.http, msg_txt).await;
-                    } else {
-                        let _ = channel_id
-                            .say(&ctx.http, "This command can only be used in a server.")
+                if let Some(owner) = owner_id {
+                    if mc.user.id != owner {
+                        let _ = mc
+                            .create_response(
+                                &ctx.http,
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("You are not the owner of this control panel.")
+                                        .ephemeral(true),
+                                ),
+                            )
                             .await;
+                        return Ok(());
                     }
                 }
-                "help" => {
-                    let fields: Vec<(String, String, bool)> = [
-                        ("ping", "Pong reply"),
-                        ("help", "Show this menu"),
-                        ("modalert", "Toggle DMs to owner for mod actions"),
-                        ("music join", "Join your voice channel"),
-                        ("music play <song>", "Search (Spotify -> YouTube) and queue"),
-                        ("music leave", "Disconnect from voice"),
-                        ("music control", "Show music control panel"),
-                        ("start <service> [args]", "Start a service defined in config"),
-                        ("start list", "Show list of services that can be started"),
-                    ]
-                    .iter()
-                    .map(|(name, desc)| {
-                        (format!("{}{}", PREFIX, name), (*desc).to_string(), false)
-                    })
-                    .collect();
 
-                    let embed = CreateEmbed::new()
-                        .title("Help Menu")
-                        .description("Use the commands below with the prefix")
-                        .color(EMBED_COLOR)
-                        .fields(fields.clone());
-
-                    let message = CreateMessage::new().embed(embed);
-
-                    let send_result = channel_id.send_message(&ctx.http, message).await;
-
-                    if let Err(why) = send_result {
-                        eprintln!("Error sending help: {why:?}");
-                    }
-                }
-                "music" => {
-                    let user_vc = if let Some(gid) = guild_id {
-                        let found = { ctx.cache.guild(gid).and_then(|g| g.voice_states.get(&author_id).and_then(|vs| vs.channel_id)) };
-                        found
-                    } else { None };
-
-                    if let Err(why) = handle_music(&ctx, channel_id, user_vc, author_id, guild_id, &args, EMBED_COLOR).await {
-                        eprintln!("Error handling music command: {why:?}");
-                    }
-                }
-                "start" => {
-                    if let Err(why) = handle_start(&ctx, channel_id, &args).await {
-                        eprintln!("Error handling start command: {why:?}");
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    async fn ready(&self, ctx: Context, ready: Ready) {
-        println!("Connected as {}", ready.user.name);
-        println!("Ready: {} guilds", ctx.cache.guild_count());
-    }
-
-    async fn guild_member_update(
-        &self,
-        ctx: Context,
-        old_if_available: Option<serenity::Member>,
-        new_if_available: Option<serenity::Member>,
-        event: serenity::model::event::GuildMemberUpdateEvent,
-    ) {
-        let gid = event.guild_id;
-
-        // Check feature flag
-        if !is_modalert_enabled(&ctx, gid).await {
-            return;
-        }
-
-        // Detect timeout being applied (communication_disabled_until increases from None or past to a future time)
-        let new_until = new_if_available
-            .as_ref()
-            .and_then(|m| m.communication_disabled_until)
-            .or(event.communication_disabled_until);
-        let old_until = old_if_available
-            .as_ref()
-            .and_then(|m| m.communication_disabled_until);
-
-        let is_timeout_newly_applied = match (old_until, new_until) {
-            (Some(old_ts), Some(new_ts)) => new_ts > old_ts,
-            (None, Some(_)) => true,
-            _ => false,
-        };
-
-        if !is_timeout_newly_applied {
-            return;
-        }
-
-        // Capture user tag early, and drop heavy objects before any await
-        let user_tag = new_if_available
-            .as_ref()
-            .map(|m| m.user.tag())
-            .unwrap_or_else(|| event.user.tag());
-        drop(new_if_available);
-
-        // Compose and send DM to the guild owner
-        let owner_id = if let Some(g) = ctx.cache.guild(gid) { g.owner_id } else {
-            match gid.to_partial_guild(&ctx.http).await {
-                Ok(pg) => pg.owner_id,
-                Err(_) => return,
-            }
-        };
-
-        let content = format!(
-            "Moderation alert: {} was timed out in server {}.",
-            user_tag,
-            gid
-        );
-
-        if let Ok(dm) = owner_id.create_dm_channel(&ctx.http).await {
-            let _ = dm.say(&ctx.http, content).await;
-        }
-    }
-
-    // Note: VC disconnect kick alerts can be added by correlating
-    // VoiceState updates with recent audit log entries (MemberDisconnect).
-    // Left out here to avoid false positives without precise variant mapping.
-
-    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::Component(mc) = interaction {
-            // custom_id format: music:<action>:<user_id>:<guild_id>
-            let custom_id = mc.data.custom_id.clone();
-            let mut parts = custom_id.split(':');
-            let prefix = parts.next().unwrap_or("");
-            if prefix != "music" { return; }
-            let action = parts.next().unwrap_or("");
-            let owner_id = parts.next().and_then(|s: &str| s.parse::<u64>().ok()).map(|v| UserId::new(v));
-            let guild_id = parts.next().and_then(|s: &str| s.parse::<u64>().ok()).map(|v| GuildId::new(v));
-
-            // Verify interaction user is same as panel owner
-            if let Some(owner) = owner_id {
-                if mc.user.id != owner {
-                    let _ = mc.create_response(&ctx.http, CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You are not the owner of this control panel.").ephemeral(true))).await;
-                    return;
-                }
-            }
-
-            // Fetch handle from TypeMap
-            let data_read = ctx.data.read().await;
-            if let Some(store) = data_read.get::<TrackStore>() {
-                let mut map = store.lock().await;
-                if let Some(gid) = guild_id {
-                    if let Some(handle) = map.get(&gid) {
-                        // perform actions
-                        let _ = match action {
-                            "pause" => handle.pause().map(|_| "Paused".to_string()).unwrap_or_else(|e| format!("Pause failed: {e:?}")),
-                            "resume" => handle.play().map(|_| "Resumed".to_string()).unwrap_or_else(|e| format!("Resume failed: {e:?}")),
-                            "stop" => {
-                                let r = handle.stop();
-                                // remove from map
-                                map.remove(&gid);
-                                r.map(|_| "Stopped".to_string()).unwrap_or_else(|e| format!("Stop failed: {e:?}"))
-                            }
-                            "vol_up" => {
-                                match handle.get_info().await {
+                // Fetch handle from TypeMap
+                let data_read = ctx.data.read().await;
+                if let Some(store) = data_read.get::<TrackStore>() {
+                    let mut map = store.lock().await;
+                    if let Some(gid) = guild_id {
+                        if let Some(handle) = map.get(&gid) {
+                            let _ = match action {
+                                "pause" => handle
+                                    .pause()
+                                    .map(|_| "Paused".to_string())
+                                    .unwrap_or_else(|e| format!("Pause failed: {e:?}")),
+                                "resume" => handle
+                                    .play()
+                                    .map(|_| "Resumed".to_string())
+                                    .unwrap_or_else(|e| format!("Resume failed: {e:?}")),
+                                "stop" => {
+                                    let r = handle.stop();
+                                    map.remove(&gid);
+                                    r.map(|_| "Stopped".to_string())
+                                        .unwrap_or_else(|e| format!("Stop failed: {e:?}"))
+                                }
+                                "vol_up" => match handle.get_info().await {
                                     Ok(info) => {
                                         let mut v = info.volume;
                                         v = (v + 0.1).min(5.0);
@@ -295,10 +363,8 @@ impl EventHandler for Handler {
                                         }
                                     }
                                     Err(e) => format!("Failed to get info: {e:?}"),
-                                }
-                            }
-                            "vol_down" => {
-                                match handle.get_info().await {
+                                },
+                                "vol_down" => match handle.get_info().await {
                                     Ok(info) => {
                                         let mut v = info.volume;
                                         v = (v - 0.1).max(0.0);
@@ -308,94 +374,116 @@ impl EventHandler for Handler {
                                         }
                                     }
                                     Err(e) => format!("Failed to get info: {e:?}"),
-                                }
-                            }
-                            _ => "Unknown action".to_string(),
-                        };
+                                },
+                                _ => "Unknown action".to_string(),
+                            };
 
-                        // Acknowledge the interaction without sending a visible message
-                        let _ = mc.create_response(&ctx.http, CreateInteractionResponse::Acknowledge).await;
+                            // Acknowledge the interaction
+                            let _ = mc
+                                .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                                .await;
 
-                        // Update the control panel embed to reflect current state (status, volume, remaining)
-                        let (new_desc, title_and_thumb) = if let Some(handle2) = map.get(&gid) {
-                            match handle2.get_info().await {
-                                Ok(info2) => {
-                                    // Try to fetch stored metadata for this guild, if present
-                                    let meta_opt = {
-                                        let data_read = ctx.data.read().await;
-                                        data_read.get::<TrackMetaStore>().cloned()
-                                    };
+                            // Update the control panel embed to reflect current state
+                            let (new_desc, title_and_thumb) = if let Some(handle2) = map.get(&gid)
+                            {
+                                match handle2.get_info().await {
+                                    Ok(info2) => {
+                                        let meta_opt = {
+                                            let data_read = ctx.data.read().await;
+                                            data_read.get::<TrackMetaStore>().cloned()
+                                        };
 
-                                    // remaining uses a clone of meta_opt so we can reuse meta_opt later
-                                    let remaining = if let Some(meta_store) = meta_opt.clone() {
-                                        let meta_map = meta_store.lock().await;
-                                        if let Some(meta) = meta_map.get(&gid) {
-                                            if let Some(total) = meta.duration {
-                                                if total > info2.position {
-                                                    let rem = total - info2.position;
-                                                    let secs = rem.as_secs();
-                                                    let mins = secs / 60;
-                                                    let secs = secs % 60;
-                                                    format!("{mins}:{:02}", secs)
+                                        let remaining = if let Some(meta_store) = meta_opt.clone() {
+                                            let meta_map = meta_store.lock().await;
+                                            if let Some(meta) = meta_map.get(&gid) {
+                                                if let Some(total) = meta.duration {
+                                                    if total > info2.position {
+                                                        let rem = total - info2.position;
+                                                        let secs = rem.as_secs();
+                                                        let mins = secs / 60;
+                                                        let secs = secs % 60;
+                                                        format!("{mins}:{:02}", secs)
+                                                    } else {
+                                                        "0:00".into()
+                                                    }
                                                 } else {
-                                                    "0:00".into()
+                                                    "Unknown".into()
                                                 }
                                             } else {
                                                 "Unknown".into()
                                             }
                                         } else {
                                             "Unknown".into()
-                                        }
-                                    } else {
-                                        "Unknown".into()
-                                    };
+                                        };
 
-                                    let mut title_str = "Music Controls".to_string();
-                                    let mut thumbnail: Option<String> = None;
-                                    if let Some(meta_store) = meta_opt {
-                                        let meta_map = meta_store.lock().await;
-                                        if let Some(meta) = meta_map.get(&gid) {
-                                            match (&meta.title, &meta.artist) {
-                                                (Some(t), Some(a)) => title_str = format!("{} — {}", t, a),
-                                                (Some(t), None) => title_str = t.clone(),
-                                                (None, Some(a)) => title_str = a.clone(),
-                                                _ => {}
+                                        let mut title_str = "Music Controls".to_string();
+                                        let mut thumbnail: Option<String> = None;
+                                        if let Some(meta_store) = meta_opt {
+                                            let meta_map = meta_store.lock().await;
+                                            if let Some(meta) = meta_map.get(&gid) {
+                                                match (&meta.title, &meta.artist) {
+                                                    (Some(t), Some(a)) => {
+                                                        title_str = format!("{} — {}", t, a)
+                                                    }
+                                                    (Some(t), None) => title_str = t.clone(),
+                                                    (None, Some(a)) => title_str = a.clone(),
+                                                    _ => {}
+                                                }
+                                                thumbnail = meta.thumbnail.clone();
                                             }
-                                            thumbnail = meta.thumbnail.clone();
                                         }
+
+                                        (
+                                            format!(
+                                                "Status: {:?}\nVolume: {:.2}\nRemaining: {}",
+                                                info2.playing, info2.volume, remaining
+                                            ),
+                                            (title_str, thumbnail),
+                                        )
                                     }
-
-                                    (format!("Status: {:?}\nVolume: {:.2}\nRemaining: {}", info2.playing, info2.volume, remaining), (title_str, thumbnail))
+                                    Err(_) => (
+                                        "Status: Unknown".into(),
+                                        ("Music Controls".into(), None),
+                                    ),
                                 }
-                                Err(_) => ("Status: Unknown".into(), ("Music Controls".into(), None)),
+                            } else {
+                                (
+                                    "No active track".into(),
+                                    ("Music Controls".into(), None),
+                                )
+                            };
+
+                            let mut ce = CreateEmbed::new()
+                                .title(title_and_thumb.0)
+                                .description(new_desc)
+                                .color(EMBED_COLOR);
+                            if let Some(th) = title_and_thumb.1 {
+                                ce = ce.thumbnail(th);
                             }
+                            let edit_msg = serenity::builder::EditMessage::new().embed(ce);
+                            let _ = mc.message.clone().edit(&ctx.http, edit_msg).await;
                         } else {
-                            ("No active track".into(), ("Music Controls".into(), None))
-                        };
-
-                        // Edit the original control panel message (if available) to update embed description and title
-                        let mut ce = CreateEmbed::new()
-                            .title(title_and_thumb.0)
-                            .description(new_desc)
-                            .color(EMBED_COLOR);
-
-                        if let Some(th) = title_and_thumb.1 {
-                            ce = ce.thumbnail(th);
+                            let _ = mc
+                                .create_response(
+                                    &ctx.http,
+                                    CreateInteractionResponse::Message(
+                                        CreateInteractionResponseMessage::new()
+                                            .content("No active track to control.")
+                                            .ephemeral(true),
+                                    ),
+                                )
+                                .await;
                         }
-
-                        let edit_msg = serenity::builder::EditMessage::new().embed(ce);
-                        let _ = mc.message.clone().edit(&ctx.http, edit_msg).await;
-
-                        return;
                     }
                 }
             }
-
-            let _ = mc.create_response(&ctx.http, CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("No active track to control.").ephemeral(true))).await;
         }
+        _ => {}
     }
+    Ok(())
 }
 
+// ---------- Main & framework ----------
 #[tokio::main]
 async fn main() {
     dotenv().ok();
@@ -415,32 +503,71 @@ async fn main() {
         eprintln!("Failed to prepare Spotify helper: {e:?}");
     }
 
-    let intents = GatewayIntents::GUILD_MESSAGES
-        | GatewayIntents::DIRECT_MESSAGES
-        | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::GUILDS
-        | GatewayIntents::GUILD_MEMBERS
-        | GatewayIntents::GUILD_VOICE_STATES;
+    let intents = serenity::GatewayIntents::GUILD_MESSAGES
+        | serenity::GatewayIntents::DIRECT_MESSAGES
+        | serenity::GatewayIntents::MESSAGE_CONTENT
+        | serenity::GatewayIntents::GUILDS
+        | serenity::GatewayIntents::GUILD_MEMBERS
+        | serenity::GatewayIntents::GUILD_VOICE_STATES;
 
-    let mut client = Client::builder(token, intents)
+    let framework = poise::Framework::builder()
+        .setup(|ctx, _ready, framework| {
+            Box::pin(async move {
+                // Initialize shared stores
+                {
+                    let mut data = ctx.data.write().await;
+                    data.insert::<TrackStore>(Arc::new(Mutex::new(HashMap::new())));
+                    data.insert::<TrackMetaStore>(Arc::new(Mutex::new(HashMap::new())));
+                    // Load ModAlert settings into shared store
+                    if let Ok(store) = ensure_modalert_store().await {
+                        data.insert::<ModAlertStore>(store);
+                    }
+                }
+
+                // Register in all existing guilds for immediate availability
+                for gid in ctx.cache.guilds() {
+                    if let Err(e) = poise::builtins::register_in_guild(ctx, &framework.options().commands, gid).await {
+                        eprintln!("Failed to register commands in guild {}: {e:?}", gid);
+                    }
+                }
+
+                // Optional: clear any previously set global commands to prevent duplicates
+                // If you want to keep global commands, comment this out.
+                let _ = serenity::all::Command::set_global_commands(&ctx.http, vec![]).await;
+                Ok(Data)
+            })
+        })
+        .options(poise::FrameworkOptions {
+            commands: vec![
+                ping(),
+                help(),
+                modalert(),
+                music(),
+                music_join(),
+                music_play(),
+                music_leave(),
+                music_control(),
+                start_service(),
+            ],
+            prefix_options: poise::PrefixFrameworkOptions {
+                prefix: Some(PREFIX.into()),
+                ..Default::default()
+            },
+            event_handler: |ctx, event, framework, data| {
+                Box::pin(poise_event_handler(ctx, event, framework, data))
+            },
+            ..Default::default()
+        })
+        .build();
+
+    let mut client = serenity::ClientBuilder::new(token, intents)
         .register_songbird()
-        .event_handler(Handler)
+        .framework(framework)
         .await
         .expect("Err creating client");
-
-    // Initialize shared track handle storage and meta store
-    {
-        let mut data = client.data.write().await;
-        data.insert::<TrackStore>(Arc::new(Mutex::new(HashMap::new())));
-        data.insert::<TrackMetaStore>(Arc::new(Mutex::new(HashMap::new())));
-        // Load ModAlert settings into shared store
-        if let Ok(store) = ensure_modalert_store().await {
-            data.insert::<ModAlertStore>(store);
-        }
-    }
-
 
     if let Err(why) = client.start().await {
         eprintln!("Client error: {why:?}");
     }
 }
+
