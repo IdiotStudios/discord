@@ -5,7 +5,6 @@ use serenity::{
     prelude::*,
 };
 use poise::serenity_prelude as serenity;
-use poise::FrameworkError;
 use songbird::SerenityInit;
 use dotenvy::dotenv;
 use std::env;
@@ -13,10 +12,12 @@ use std::env;
 mod music;
 mod start;
 mod config;
+mod modalert;
 
 use crate::config::ensure_default_config;
 use crate::music::{ensure_media_tools, handle_music};
 use crate::start::{handle_start};
+use crate::modalert::{ensure_modalert_store, save_modalert_store, ModAlertStore, is_modalert_enabled};
 use serenity::all::Interaction;
 use serenity::model::id::{GuildId, UserId};
 use serenity::prelude::TypeMapKey;
@@ -78,10 +79,61 @@ impl EventHandler for Handler {
                         eprintln!("Error sending message: {why:?}");
                     }
                 }
+                "modalert" => {
+                    if let Some(gid) = guild_id {
+                        // Only guild owner can toggle
+                        let cached_owner = { ctx.cache.guild(gid).map(|g| g.owner_id) };
+                        let mut is_owner = cached_owner.map(|oid| oid == author_id).unwrap_or(false);
+                        if !is_owner {
+                            if let Ok(pg) = gid.to_partial_guild(&ctx.http).await {
+                                is_owner = pg.owner_id == author_id;
+                            }
+                        }
+                        if !is_owner {
+                            let _ = channel_id
+                                .say(&ctx.http, "Only the server owner can toggle mod alerts.")
+                                .await;
+                            return;
+                        }
+
+                        // Toggle in shared store and persist
+                        let toggled_on = {
+                            let data = ctx.data.read().await;
+                            if let Some(store) = data.get::<ModAlertStore>() {
+                                let mut set = store.lock().await;
+                                if set.contains(&gid) {
+                                    set.remove(&gid);
+                                    false
+                                } else {
+                                    set.insert(gid);
+                                    true
+                                }
+                            } else {
+                                false
+                            }
+                        };
+
+                        if let Err(e) = save_modalert_store(&ctx).await {
+                            eprintln!("Failed saving modalert store: {e:?}");
+                        }
+
+                        let msg_txt = if toggled_on {
+                            "Mod alerts enabled for this server."
+                        } else {
+                            "Mod alerts disabled for this server."
+                        };
+                        let _ = channel_id.say(&ctx.http, msg_txt).await;
+                    } else {
+                        let _ = channel_id
+                            .say(&ctx.http, "This command can only be used in a server.")
+                            .await;
+                    }
+                }
                 "help" => {
                     let fields: Vec<(String, String, bool)> = [
                         ("ping", "Pong reply"),
                         ("help", "Show this menu"),
+                        ("modalert", "Toggle DMs to owner for mod actions"),
                         ("music join", "Join your voice channel"),
                         ("music play <song>", "Search (Spotify -> YouTube) and queue"),
                         ("music leave", "Disconnect from voice"),
@@ -110,11 +162,10 @@ impl EventHandler for Handler {
                     }
                 }
                 "music" => {
-                    let user_vc = guild_id.and_then(|gid| {
-                        ctx.cache
-                            .guild(gid)
-                            .and_then(|g| g.voice_states.get(&author_id).and_then(|vs| vs.channel_id))
-                    });
+                    let user_vc = if let Some(gid) = guild_id {
+                        let found = { ctx.cache.guild(gid).and_then(|g| g.voice_states.get(&author_id).and_then(|vs| vs.channel_id)) };
+                        found
+                    } else { None };
 
                     if let Err(why) = handle_music(&ctx, channel_id, user_vc, author_id, guild_id, &args, EMBED_COLOR).await {
                         eprintln!("Error handling music command: {why:?}");
@@ -134,6 +185,69 @@ impl EventHandler for Handler {
         println!("Connected as {}", ready.user.name);
         println!("Ready: {} guilds", ctx.cache.guild_count());
     }
+
+    async fn guild_member_update(
+        &self,
+        ctx: Context,
+        old_if_available: Option<serenity::Member>,
+        new_if_available: Option<serenity::Member>,
+        event: serenity::model::event::GuildMemberUpdateEvent,
+    ) {
+        let gid = event.guild_id;
+
+        // Check feature flag
+        if !is_modalert_enabled(&ctx, gid).await {
+            return;
+        }
+
+        // Detect timeout being applied (communication_disabled_until increases from None or past to a future time)
+        let new_until = new_if_available
+            .as_ref()
+            .and_then(|m| m.communication_disabled_until)
+            .or(event.communication_disabled_until);
+        let old_until = old_if_available
+            .as_ref()
+            .and_then(|m| m.communication_disabled_until);
+
+        let is_timeout_newly_applied = match (old_until, new_until) {
+            (Some(old_ts), Some(new_ts)) => new_ts > old_ts,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+
+        if !is_timeout_newly_applied {
+            return;
+        }
+
+        // Capture user tag early, and drop heavy objects before any await
+        let user_tag = new_if_available
+            .as_ref()
+            .map(|m| m.user.tag())
+            .unwrap_or_else(|| event.user.tag());
+        drop(new_if_available);
+
+        // Compose and send DM to the guild owner
+        let owner_id = if let Some(g) = ctx.cache.guild(gid) { g.owner_id } else {
+            match gid.to_partial_guild(&ctx.http).await {
+                Ok(pg) => pg.owner_id,
+                Err(_) => return,
+            }
+        };
+
+        let content = format!(
+            "Moderation alert: {} was timed out in server {}.",
+            user_tag,
+            gid
+        );
+
+        if let Ok(dm) = owner_id.create_dm_channel(&ctx.http).await {
+            let _ = dm.say(&ctx.http, content).await;
+        }
+    }
+
+    // Note: VC disconnect kick alerts can be added by correlating
+    // VoiceState updates with recent audit log entries (MemberDisconnect).
+    // Left out here to avoid false positives without precise variant mapping.
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         if let Interaction::Component(mc) = interaction {
@@ -319,6 +433,10 @@ async fn main() {
         let mut data = client.data.write().await;
         data.insert::<TrackStore>(Arc::new(Mutex::new(HashMap::new())));
         data.insert::<TrackMetaStore>(Arc::new(Mutex::new(HashMap::new())));
+        // Load ModAlert settings into shared store
+        if let Ok(store) = ensure_modalert_store().await {
+            data.insert::<ModAlertStore>(store);
+        }
     }
 
 
