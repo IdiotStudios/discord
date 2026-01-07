@@ -2,4 +2,6 @@
 .env
 /tools/librespot-wrapper/.env
 /tools/librespot-wrapper/target
+# Custom Voice Client for private use
+/tools/voice-client
 sync_config.jsonc
